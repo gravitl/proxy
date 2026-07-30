@@ -104,7 +104,7 @@ Note: Original plan used `pkg/proxy`; **as shipped**, types live at module root 
 ```text
 ┌─────────────────────────────────────────────────────────┐
 │  Adapter / Netmaker (NOT in this package)               │
-│  - token / Authenticator                                │
+│  - Authenticator (WG key proof)                         │
 │  - relay selection, RelayedBy                           │
 │  - wire userspace WG Bind ↔ SendPacket / inject         │
 │  - call SendToPeer from existing relay reverse path     │
@@ -187,7 +187,7 @@ TCP connect → TLS handshake → MsgHello → Authenticator.ValidateClientHello
 → DATA / PING / PONG loop
 ```
 
-`ClientHello` fields: `version`, `node_id`, `relay_peer_id`, `network_id`, `token`, `timestamp`.  
+`ClientHello` fields: `version`, `node_id`, `relay_peer_id`, `network_id`, `public_key`, `timestamp`, `proof` (WG key possession MAC; not control-plane JWT).  
 Validation is **delegated** to `Authenticator` — package only enforces message order.
 
 ### 5.5 Client architecture
@@ -256,7 +256,7 @@ Userspace WG (conn.Bind)
   Send → if dest == relay UDP endpoint → proxy.Client.SendPacket
   Recv ← proxy PacketHandler injects bytes as if from relay
 Daemon starts proxy.Client when UseTcpUplink is set (from peer update / HostPull)
-TLS + HelloFactory(token from auth.Authenticate)
+TLS + HelloFactory (WG public_key + proof via X25519 DH-HMAC)
 Dial gateway TcpProxyEndpoint from PeerIDs / HostNetworkInfo
 ```
 
@@ -264,7 +264,7 @@ Dial gateway TcpProxyEndpoint from PeerIDs / HostNetworkInfo
 
 ```text
 proxy.Server on B (same host as WG peer) when TcpProxyEnabled
-Authenticator validates token → PeerID
+Authenticator validates WG proof + RelayedNodes → PeerID
 PacketHandler → existing relay / WG inject path
 Relay reverse path → server.SendToPeer(peerID, pkt)
 ```

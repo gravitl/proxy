@@ -19,7 +19,8 @@ func ExampleClient() {
 		TLSConfig:  &tls.Config{MinVersion: tls.VersionTLS12},
 		HelloFactory: func() (proxy.ClientHello, error) {
 			return proxy.ClientHello{
-				Version: 1, NodeID: "node", RelayPeerID: "relay", Token: "token",
+				Version: 1, NodeID: "node", RelayPeerID: "relay",
+				PublicKey: "wg-pubkey", Proof: "proof",
 				Timestamp: time.Now().Unix(),
 			}, nil
 		},

@@ -63,7 +63,7 @@ func TestClientServerDataRoundTrip(t *testing.T) {
 			return c
 		}(),
 		HelloFactory: func() (ClientHello, error) {
-			return ClientHello{Version: 1, NodeID: "n1", RelayPeerID: "r1", Token: "t"}, nil
+			return ClientHello{Version: 1, NodeID: "n1", RelayPeerID: "r1", PublicKey: "pk", Proof: "p"}, nil
 		},
 		PacketHandler: func(b []byte) error {
 			inMu.Lock()
