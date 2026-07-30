@@ -11,6 +11,8 @@ Import path: `github.com/gravitl/proxy`
 
 See package documentation and `example_test.go` for wiring patterns.
 
+Detailed Phase 1 plan and architecture: [docs/PROXY_PHASE1_ARCHITECTURE.md](docs/PROXY_PHASE1_ARCHITECTURE.md).
+
 ## Develop
 
 ```bash
