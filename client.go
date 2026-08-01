@@ -176,11 +176,13 @@ func (c *Client) SendPacket(ctx context.Context, pkt []byte) error {
 		SessionID:  sid,
 		PayloadLen: uint32(len(pkt)),
 	}
-	// Bound write so callers (and async uplink workers) cannot hang forever.
+	// Copy conn under lock; release before write so Stop can close the conn and
+	// unblock a stuck writer via SetWriteDeadline / Close.
+	c.mu.Unlock()
+
 	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	err := writeFrame(conn, hdr, pkt)
 	_ = conn.SetWriteDeadline(time.Time{})
-	c.mu.Unlock()
 	if err == nil {
 		c.metrics.IncCounter("proxy_client_frames_out_total", nil)
 	}
