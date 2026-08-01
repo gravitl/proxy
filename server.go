@@ -328,7 +328,10 @@ func (c *connSession) writeFrameLocked(msgType uint8, payload []byte) error {
 func (c *connSession) writeFrame(msgType uint8, payload []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	return c.writeFrameLocked(msgType, payload)
+	_ = c.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	err := c.writeFrameLocked(msgType, payload)
+	_ = c.conn.SetWriteDeadline(time.Time{})
+	return err
 }
 
 func (c *connSession) sendData(_ context.Context, pkt []byte) error {

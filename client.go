@@ -155,6 +155,7 @@ func (c *Client) Stop(ctx context.Context) error {
 
 // SendPacket sends a DATA frame with the current session ID (spec §9.1).
 func (c *Client) SendPacket(ctx context.Context, pkt []byte) error {
+	_ = ctx
 	if c.closed.Load() {
 		return ErrClientClosed
 	}
@@ -165,8 +166,8 @@ func (c *Client) SendPacket(ctx context.Context, pkt []byte) error {
 	conn := c.tlsConn
 	sid := c.sessID
 	st := c.State()
-	c.mu.Unlock()
 	if conn == nil || st != StateActive {
+		c.mu.Unlock()
 		return ErrClientClosed
 	}
 	hdr := FrameHeader{
@@ -175,12 +176,11 @@ func (c *Client) SendPacket(ctx context.Context, pkt []byte) error {
 		SessionID:  sid,
 		PayloadLen: uint32(len(pkt)),
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.tlsConn != conn || c.State() != StateActive {
-		return ErrClientClosed
-	}
+	// Bound write so callers (and async uplink workers) cannot hang forever.
+	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	err := writeFrame(conn, hdr, pkt)
+	_ = conn.SetWriteDeadline(time.Time{})
+	c.mu.Unlock()
 	if err == nil {
 		c.metrics.IncCounter("proxy_client_frames_out_total", nil)
 	}
