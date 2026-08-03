@@ -22,6 +22,7 @@ type ServerOptions struct {
 	Logger          Logger
 	Metrics         MetricsSink
 	KeepAlivePeriod time.Duration
+	WriteTimeout    time.Duration
 	MaxFrameSize    int
 }
 
@@ -33,6 +34,7 @@ type Server struct {
 	registry     SessionRegistry
 	maxPayload   uint32
 	keepAlive    time.Duration
+	writeTimeout time.Duration
 	sessionIDGen atomic.Uint32
 	listener     net.Listener
 	closed       atomic.Bool
@@ -77,14 +79,19 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	if ka <= 0 {
 		ka = 30 * time.Second
 	}
+	wt := opts.WriteTimeout
+	if wt <= 0 {
+		wt = 2 * time.Second
+	}
 	return &Server{
-		opts:       opts,
-		log:        log,
-		metrics:    metrics,
-		registry:   reg,
-		maxPayload: uint32(max),
-		keepAlive:  ka,
-		shutdown:   make(chan struct{}),
+		opts:         opts,
+		log:          log,
+		metrics:      metrics,
+		registry:     reg,
+		maxPayload:   uint32(max),
+		keepAlive:    ka,
+		writeTimeout: wt,
+		shutdown:     make(chan struct{}),
 	}, nil
 }
 
@@ -328,7 +335,10 @@ func (c *connSession) writeFrameLocked(msgType uint8, payload []byte) error {
 func (c *connSession) writeFrame(msgType uint8, payload []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	return c.writeFrameLocked(msgType, payload)
+	_ = c.conn.SetWriteDeadline(time.Now().Add(c.server.writeTimeout))
+	err := c.writeFrameLocked(msgType, payload)
+	_ = c.conn.SetWriteDeadline(time.Time{})
+	return err
 }
 
 func (c *connSession) sendData(_ context.Context, pkt []byte) error {
