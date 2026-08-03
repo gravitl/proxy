@@ -1,4 +1,4 @@
-package proxy
+package uplink
 
 type noopLogger struct{}
 

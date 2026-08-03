@@ -1,8 +1,8 @@
 # Netmaker Phase 1 Proxy — Implemented Plan & Current Architecture
 
-**Module:** `github.com/gravitl/proxy` (flat package at repo root; import `github.com/gravitl/proxy`)  
-**Commit:** `feat(proxy): add TCP/TLS framed transport for relay uplinks`  
-**Status:** Phase 1 **transport library is implemented and tested**. Netclient/relay integration is **not** currently in the netclient tree.
+**Module:** `github.com/gravitl/proxy`  
+**Import:** `github.com/gravitl/proxy/uplink` (Phase 1 transport; not at module root)  
+**Status:** Phase 1 **transport library is implemented and tested** under `uplink/`. Netclient wires it via `internal/proxyuplink`.
 
 ---
 
@@ -32,34 +32,34 @@ Phase 1: C -- TCP/TLS (WG packets) --> B -- relay --> A/D
 | Principle | How it shows up |
 |-----------|-----------------|
 | Package-first | Standalone Go module, importable |
-| Transport ≠ policy | No Netmaker DB, routing, or relay selection inside `proxy` |
+| Transport ≠ policy | No Netmaker DB, routing, or relay selection inside `uplink` |
 | Small API | `Client` + `Server` + hooks |
 | Plug-and-play | Auth, packet handling, registry, logger, metrics are interfaces/callbacks |
-| Extensible later | TLS config, hooks; no HTTP CONNECT / mTLS / multitenancy yet |
+| Feature folders | WG uplink in `uplink/`; HTTP CONNECT egress in sibling `l7/` |
 
-**Out of scope (still):** UDP→TCP fallback, HTTP CONNECT, WebSocket, mTLS requirement, active-active relay, node-global proxy mode.
+**Out of scope for uplink:** UDP→TCP fallback, WebSocket, mTLS requirement, active-active relay, node-global proxy mode. HTTP CONNECT lives in package `l7` (see PROXY_L7_EGRESS.md).
 
 ---
 
 ## 3. What was implemented (checklist)
 
-### Done in `gravitl/proxy`
+### Done in `gravitl/proxy/uplink`
 
 | Item | Status | Location |
 |------|--------|----------|
-| Module + `go.mod` | Done | `go.mod` (Go 1.22) |
-| Framing codec | Done | `frame.go` |
-| Protocol constants | Done | `protocol.go` |
-| Types / states / hello | Done | `types.go` |
-| Hooks | Done | `interfaces.go` |
-| Errors | Done | `errors.go` |
-| In-memory registry | Done | `registry.go` |
-| No-op logger/metrics | Done | `noop.go` |
-| Client (TLS, HELLO, DATA, ping, reconnect) | Done | `client.go` |
-| Server (TLS, auth, registry, SendToPeer) | Done | `server.go` |
-| Frame unit tests | Done | `frame_test.go` |
-| TLS integration round-trip | Done | `integration_test.go` |
-| Package doc + README + example | Done | `doc.go`, `README.md`, `example_test.go` |
+| Module + `go.mod` | Done | `go.mod` |
+| Framing codec | Done | `uplink/frame.go` |
+| Protocol constants | Done | `uplink/protocol.go` |
+| Types / states / hello | Done | `uplink/types.go` |
+| Hooks | Done | `uplink/interfaces.go` |
+| Errors | Done | `uplink/errors.go` |
+| In-memory registry | Done | `uplink/registry.go` |
+| No-op logger/metrics | Done | `uplink/noop.go` |
+| Client (TLS, HELLO, DATA, ping, reconnect) | Done | `uplink/client.go` |
+| Server (TLS, auth, registry, SendToPeer) | Done | `uplink/server.go` |
+| Frame unit tests | Done | `uplink/frame_test.go` |
+| TLS integration round-trip | Done | `uplink/integration_test.go` |
+| Package doc + example | Done | `uplink/doc.go`, `uplink/example_test.go` |
 
 ### Planned but not landed (outside this repo)
 
@@ -78,22 +78,25 @@ Phase 1: C -- TCP/TLS (WG packets) --> B -- relay --> A/D
 github.com/gravitl/proxy/
 ├── go.mod
 ├── README.md
-├── doc.go              # package role / non-goals
-├── protocol.go         # version, Msg* types, DefaultMaxFrameSize
-├── types.go            # ClientHello, AuthResult, states, BackoffConfig
-├── interfaces.go       # PacketHandler, Authenticator, SessionRegistry, Session, Logger, Metrics
-├── errors.go
-├── frame.go            # 12-byte header encode/decode
-├── registry.go         # InMemoryRegistry (replace-on-attach)
-├── noop.go
-├── client.go           # Client API + supervisor/reconnect
-├── server.go           # Server API + accept/session loops
-├── frame_test.go
-├── integration_test.go
-└── example_test.go
+├── doc.go                 # module overview (no public API)
+├── docs/
+├── uplink/                # Phase 1 WG TCP/TLS transport (import …/uplink)
+│   ├── doc.go
+│   ├── client.go
+│   ├── server.go
+│   ├── frame.go
+│   ├── protocol.go
+│   ├── types.go
+│   ├── interfaces.go
+│   ├── registry.go
+│   ├── hellomac.go
+│   ├── errors.go
+│   ├── noop.go
+│   └── *_test.go
+└── l7/                    # HTTP CONNECT egress (sibling package)
 ```
 
-Note: Original plan used `pkg/proxy`; **as shipped**, types live at module root (`import "github.com/gravitl/proxy"`).
+Import: `github.com/gravitl/proxy/uplink` (e.g. `uplink.Client`, `uplink.Server`).
 
 ---
 
@@ -336,4 +339,4 @@ Schema: `schema.Node` fields in netmaker; converters in `logic/nodes.go`; popula
 
 ---
 
-**One-line summary:** Phase 1 **TCP/TLS framed WG transport library** is complete; **control-plane opt-in flags** for gateway TCP listen and per-node uplink are published via peer updates. Making traffic actually flow still needs **userspace WireGuard (or inject) + netclient adapters** on client and gateway.
+**One-line summary:** Phase 1 **TCP/TLS framed WG transport** lives in `github.com/gravitl/proxy/uplink` and is wired by netclient `internal/proxyuplink`. Sibling package `l7` implements HTTP CONNECT egress with domain ACL (see PROXY_L7_EGRESS.md).

@@ -1,4 +1,4 @@
-package proxy
+package uplink
 
 // Protocol version for Phase 1 framing.
 const ProtocolVersion uint8 = 1
