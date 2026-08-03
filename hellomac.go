@@ -5,20 +5,38 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"fmt"
-	"strconv"
 )
 
 // HelloMACInput returns the stable byte sequence covered by ClientHello.Proof.
 // Proof itself is excluded so the client can compute the MAC before setting it.
+//
+// Encoding is length-prefixed to avoid delimiter ambiguity:
+//   version (uint32 BE) ||
+//   len||node_id || len||relay_peer_id || len||network_id || len||public_key ||
+//   timestamp (int64 BE)
+// where each len is a uint32 big-endian byte length of the following field.
 func HelloMACInput(h ClientHello) []byte {
-	// version|node_id|relay_peer_id|network_id|public_key|timestamp
-	return []byte(strconv.Itoa(h.Version) + "|" +
-		h.NodeID + "|" +
-		h.RelayPeerID + "|" +
-		h.NetworkID + "|" +
-		h.PublicKey + "|" +
-		strconv.FormatInt(h.Timestamp, 10))
+	n := 4 + 4 + len(h.NodeID) + 4 + len(h.RelayPeerID) + 4 + len(h.NetworkID) + 4 + len(h.PublicKey) + 8
+	b := make([]byte, 0, n)
+	var tmp [8]byte
+	binary.BigEndian.PutUint32(tmp[:4], uint32(h.Version))
+	b = append(b, tmp[:4]...)
+	b = appendLenPrefixed(b, h.NodeID)
+	b = appendLenPrefixed(b, h.RelayPeerID)
+	b = appendLenPrefixed(b, h.NetworkID)
+	b = appendLenPrefixed(b, h.PublicKey)
+	binary.BigEndian.PutUint64(tmp[:], uint64(h.Timestamp))
+	b = append(b, tmp[:]...)
+	return b
+}
+
+func appendLenPrefixed(b []byte, s string) []byte {
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(s)))
+	b = append(b, lenBuf[:]...)
+	return append(b, s...)
 }
 
 // ComputeHelloProof builds Proof = base64(HMAC-SHA256(X25519(ourPriv, peerPub), macInput)).

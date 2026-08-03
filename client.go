@@ -22,6 +22,7 @@ type ClientOptions struct {
 	Logger           Logger
 	Metrics          MetricsSink
 	KeepAlivePeriod  time.Duration
+	WriteTimeout     time.Duration
 	ReconnectBackoff BackoffConfig
 	MaxFrameSize     int
 }
@@ -32,10 +33,11 @@ type Client struct {
 	addr       string
 	log        Logger
 	metrics    MetricsSink
-	maxPayload uint32
-	backoff    BackoffConfig
-	keepAlive  time.Duration
-	tlsConfig  *tls.Config
+	maxPayload   uint32
+	backoff      BackoffConfig
+	keepAlive    time.Duration
+	writeTimeout time.Duration
+	tlsConfig    *tls.Config
 
 	mu      sync.Mutex
 	state   atomic.Value // ClientState
@@ -77,19 +79,24 @@ func NewClient(opts ClientOptions) (*Client, error) {
 	if ka <= 0 {
 		ka = 30 * time.Second
 	}
+	wt := opts.WriteTimeout
+	if wt <= 0 {
+		wt = 2 * time.Second
+	}
 	cfg := opts.TLSConfig.Clone()
 	if opts.ServerName != "" {
 		cfg.ServerName = opts.ServerName
 	}
 	c := &Client{
-		opts:       opts,
-		addr:       opts.Addr,
-		log:        log,
-		metrics:    metrics,
-		maxPayload: uint32(max),
-		backoff:    opts.ReconnectBackoff.withDefaults(),
-		keepAlive:  ka,
-		tlsConfig:  cfg,
+		opts:         opts,
+		addr:         opts.Addr,
+		log:          log,
+		metrics:      metrics,
+		maxPayload:   uint32(max),
+		backoff:      opts.ReconnectBackoff.withDefaults(),
+		keepAlive:    ka,
+		writeTimeout: wt,
+		tlsConfig:    cfg,
 	}
 	c.state.Store(ClientState(StateDisconnected))
 	return c, nil
@@ -180,7 +187,7 @@ func (c *Client) SendPacket(ctx context.Context, pkt []byte) error {
 	// unblock a stuck writer via SetWriteDeadline / Close.
 	c.mu.Unlock()
 
-	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	_ = conn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
 	err := writeFrame(conn, hdr, pkt)
 	_ = conn.SetWriteDeadline(time.Time{})
 	if err == nil {
