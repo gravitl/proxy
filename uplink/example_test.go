@@ -1,4 +1,4 @@
-package proxy_test
+package uplink_test
 
 import (
 	"context"
@@ -6,19 +6,19 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/gravitl/proxy"
+	"github.com/gravitl/proxy/uplink"
 )
 
 func ExampleClient() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	c, err := proxy.NewClient(proxy.ClientOptions{
+	c, err := uplink.NewClient(uplink.ClientOptions{
 		Addr:       "relay.example.com:443",
 		ServerName: "relay.example.com",
 		TLSConfig:  &tls.Config{MinVersion: tls.VersionTLS12},
-		HelloFactory: func() (proxy.ClientHello, error) {
-			return proxy.ClientHello{
+		HelloFactory: func() (uplink.ClientHello, error) {
+			return uplink.ClientHello{
 				Version: 1, NodeID: "node", RelayPeerID: "relay",
 				PublicKey: "wg-pubkey", Proof: "proof",
 				Timestamp: time.Now().Unix(),

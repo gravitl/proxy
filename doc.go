@@ -1,7 +1,9 @@
-// Package proxy provides a TCP/TLS framed transport for carrying WireGuard packet
-// payloads between a relay-attached peer and its relay/gateway (Phase 1 uplink).
+// Module github.com/gravitl/proxy hosts Netmaker proxy libraries as subpackages.
 //
-// It owns connection setup, TLS, framing, session lifecycle, keepalive, and
-// peer→session registration for reverse traffic. It does not implement routing policy,
-// relay selection, or Netmaker control-plane logic—integrate those in a separate adapter.
+// Import paths:
+//
+//	github.com/gravitl/proxy/uplink  — TCP/TLS framed WireGuard uplink transport
+//	github.com/gravitl/proxy/l7      — HTTP CONNECT app-domain egress proxy
+//
+// The module root has no public API; use the packages above.
 package proxy
