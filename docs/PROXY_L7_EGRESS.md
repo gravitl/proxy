@@ -1,57 +1,86 @@
 # L7 egress proxy — HTTP CONNECT for app domains
 
-**Package:** `github.com/gravitl/proxy/l7`  
-**Status:** HTTP CONNECT MVP implemented (listen, ACL, dial, bidirectional tunnel).
+**Packages:** `github.com/gravitl/proxy/l7`, `github.com/gravitl/proxy/sysproxy`  
+**Status:** CONNECT MVP + Netmaker integration (`routing_mode=proxy`).
 
 ## Problem
 
-Egress “app domains” today often resolve domain → IPs, publish ranges, and install WireGuard routes. That is brittle (CDN churn, shared IPs, wildcards).
+Egress “app domains” today often resolve domain → IPs, publish ranges, and install WireGuard routes. That is brittle for global SaaS/CDN (IP churn, shared IPs, wildcards).
 
-## Approach
+## Modes (per app egress)
 
-Keep the **WireGuard underlay** to the egress gateway. For listed domains, the **client** directs traffic to an L7 proxy on the gateway (proxy settings / PAC / netclient-managed). The gateway dials by **hostname**.
+| `routing_mode` | Behavior |
+|----------------|----------|
+| `ip` (default) | Existing path: resolve → `EgressWithDomains` → `/32` routes via egress GW |
+| `proxy` | No domain IP routes. Clients use HTTP CONNECT through the egress GW |
+
+## End-to-end flow (`proxy`)
 
 ```text
-App --HTTPS--> client proxy settings
-       --CONNECT api.foo.com:443--> GW_mesh_IP:l7_port   (over WG)
-       --GW dials api.foo.com--> internet
+UI: create app egress with routing_mode=proxy
+  → netmaker stores domains; skips EGRESS_UPDATE
+  → PeerUpdate / HostPull includes egress_proxy_routes[]
+       { domains, node_id, proxy_addr=meshIP:3128 }
+
+Egress GW netclient:
+  → starts l7.Server on mesh IP:3128 with Allowlist(domains)
+
+Other netclients:
+  → local CONNECT forwarder on 127.0.0.1:17832
+  → writes egress_proxy.pac and applies OS system PAC automatically
+  → browser / PAC-aware apps → CONNECT api.foo.com → forwarder → GW over WG → dial by name
 ```
 
-| Role | Responsibility |
-|------|----------------|
-| Client / control plane | Which domains use egress L7 |
-| WireGuard | Path from client to egress GW |
-| `l7.Server` on GW | CONNECT + domain ACL + dial-out |
+WireGuard only carries TCP to the **mesh proxy address**. CDN IPs are never installed as client WG routes.
 
-CIDR / network egress remains L3. L7 is additive for named apps.
+## Client usage (automatic)
 
-## Package API
+`sysproxy` (called by netclient) writes the PAC and applies/clears the OS proxy:
 
-- `DomainMatcher` / `Allowlist` / `AllowAll` — exact and `*.suffix` domain rules
-- `ServerOptions` — `ListenAddr`, `Matcher` (required), optional `Dialer`, timeouts, logger
-- `Server.Start` / `Stop` / `Addr` — TCP listen and CONNECT handling
-- Responses: `200 Connection Established`, `403` deny, `400` bad request, `502` dial failure
+| Platform | Mechanism |
+|----------|-----------|
+| macOS | `networksetup -setautoproxyurl` / `-setautoproxystate` on active services |
+| Windows | `AutoConfigURL` in Internet Settings (current user + loaded user hives) |
+| Linux | GNOME `gsettings` auto PAC + optional `/etc/profile.d` drop-in |
 
-## Non-goals (for now)
+API: `sysproxy.WritePAC`, `sysproxy.Apply`, `sysproxy.Clear`.
 
-- SOCKS5, transparent TPROXY, TLS MITM
-- PAC generation, UI, control-plane domain publishing (netclient follow-up)
-- Sharing code with `uplink` framed WG transport
+Browsers that honor system PAC need no manual config. When all proxy routes are removed (or the daemon stops), the system PAC is cleared.
+
+CLI tools that ignore system proxy can still use:
+
+```bash
+export HTTPS_PROXY=http://127.0.0.1:17832
+curl -v https://allowed.example.com/
+```
+
+**Not supported via proxy:** ICMP/`ping`, most UDP. Use `routing_mode=ip` or internet egress for those.
+
+## Package API (`l7`)
+
+- `DomainMatcher` / `Allowlist` / `AllowAll`
+- `Server` — CONNECT accept, ACL, dial, bidirectional pipe
+- Responses: `200` / `403` / `400` / `502`
+
+## Package API (`sysproxy`)
+
+- `WritePAC(path, domains, proxyHostPort)` — PAC that steers listed domains
+- `Apply(pacPath, Options)` / `Clear(Options)` — install/remove OS auto-proxy
+
+## Netclient
+
+- `internal/proxyegress.ApplyProxyRoutes` — wires `l7` + `sysproxy` from peer update / pull
+- `internal/proxyegress.Stop()` on daemon teardown (calls `sysproxy.Clear`)
+
+## Control plane fields
+
+- `schema.Egress.RoutingMode` — `ip` | `proxy`
+- `models.EgressProxyRoute` on `HostPeerUpdate` / `HostPull`
+- Node `EgressProxyListenPort` (default 3128)
 
 ## Relation to `uplink`
 
-| `uplink` | `l7` |
-|----------|------|
-| Framed WG ciphertext C↔B | HTTP CONNECT to egress GW |
-| Userspace Bind inject | `net.Dial` to internet hostnames |
-| Same module, separate import | `github.com/gravitl/proxy/l7` |
-
-## Example (gateway side)
-
-```go
-srv, err := l7.NewServer(l7.ServerOptions{
-    ListenAddr: "0.0.0.0:3128", // prefer mesh IP in production
-    Matcher:    l7.Allowlist{Domains: []string{"api.foo.com", "*.saas.com"}},
-})
-// srv.Start(ctx) … srv.Stop(ctx)
-```
+| `uplink` | `l7` / proxy egress |
+|----------|---------------------|
+| Framed WG ciphertext C↔B | HTTP CONNECT for app domains |
+| UDP-blocked uplink | Avoid domain IP management |

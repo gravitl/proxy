@@ -7,7 +7,8 @@ Netmaker proxy libraries (one Go module, feature packages).
 | Import | Role |
 |--------|------|
 | [`github.com/gravitl/proxy/uplink`](uplink/) | Phase 1: TCP/TLS framed WireGuard uplink (C ↔ relay/gateway B) |
-| [`github.com/gravitl/proxy/l7`](l7/) | L7: HTTP CONNECT forward proxy for app-domain egress |
+| [`github.com/gravitl/proxy/l7`](l7/) | L7: HTTP CONNECT for app-domain egress (`routing_mode=proxy`) |
+| [`github.com/gravitl/proxy/sysproxy`](sysproxy/) | Client PAC write + OS system auto-proxy apply/clear |
 
 There is **no** root package API — import the subpackage you need.
 
