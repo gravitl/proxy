@@ -115,6 +115,80 @@ func TestClientServerDataRoundTrip(t *testing.T) {
 	_ = s.Stop(context.Background())
 }
 
+// TestServerStopClosesSessions ensures Stop closes attached TLS sessions so a client
+// leaves StateActive (gateway soft-restart must force re-HELLO onto a new server).
+func TestServerStopClosesSessions(t *testing.T) {
+	srvTLS, cliTLS := testTLSConfigs(t)
+
+	s, err := NewServer(ServerOptions{
+		ListenAddr: "127.0.0.1:0",
+		TLSConfig:  srvTLS,
+		Authenticator: &fnAuthenticator{fn: func(ctx context.Context, hello ClientHello) (*AuthResult, error) {
+			return &AuthResult{PeerID: "peer-1"}, nil
+		}},
+		PacketHandler: &fnPacketHandler{fn: func(ctx context.Context, peerID string, pkt []byte) error {
+			return nil
+		}},
+		Logger: noopLogger{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	cli, err := NewClient(ClientOptions{
+		Addr: s.Addr().String(),
+		TLSConfig: func() *tls.Config {
+			c := cliTLS.Clone()
+			c.ServerName = "test.local"
+			return c
+		}(),
+		HelloFactory: func() (ClientHello, error) {
+			return ClientHello{Version: 1, NodeID: "n1", RelayPeerID: "r1", PublicKey: "pk", Proof: "p"}, nil
+		},
+		PacketHandler:   func(b []byte) error { return nil },
+		Logger:          noopLogger{},
+		KeepAlivePeriod: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.After(5 * time.Second)
+	for cli.State() != StateActive {
+		select {
+		case <-deadline:
+			t.Fatalf("client not active: %s", cli.State())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer stopCancel()
+	if err := s.Stop(stopCtx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	deadline = time.After(3 * time.Second)
+	for cli.State() == StateActive {
+		select {
+		case <-deadline:
+			t.Fatal("client still Active after Server.Stop; session was not closed")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	_ = cli.Stop(context.Background())
+}
+
 type fnPacketHandler struct {
 	fn func(context.Context, string, []byte) error
 }

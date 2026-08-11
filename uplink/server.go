@@ -154,7 +154,10 @@ func (s *Server) Addr() net.Addr {
 	return s.listener.Addr()
 }
 
-// Stop closes the listener and waits for handlers to finish.
+// Stop closes the listener, forcibly closes all attached sessions, and waits for handlers.
+// Session close is required: Accept() stopping alone leaves live TLS conns that still
+// answer client PING/PONG, so clients stay StateActive and never re-HELLO the new server
+// after a netclient soft restart (SIGHUP / pull).
 func (s *Server) Stop(ctx context.Context) error {
 	s.shutdownOnce.Do(func() {
 		close(s.shutdown)
@@ -165,6 +168,10 @@ func (s *Server) Stop(ctx context.Context) error {
 		s.startMu.Unlock()
 		if ln != nil {
 			_ = ln.Close()
+		}
+		// Unblock session readLoops so clients reconnect to a new listener.
+		if closer, ok := s.registry.(interface{ CloseAll() }); ok {
+			closer.CloseAll()
 		}
 	})
 
@@ -356,11 +363,32 @@ func (c *connSession) readLoop(ctx context.Context) {
 		if c.closed.Load() {
 			return
 		}
+		select {
+		case <-ctx.Done():
+			_ = c.Close()
+			return
+		case <-c.server.shutdown:
+			_ = c.Close()
+			return
+		default:
+		}
 		_ = c.conn.SetReadDeadline(time.Now().Add(c.server.keepAlive * 3))
 		h, payload, err := readFrame(c.conn, c.server.maxPayload)
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
 				return
+			}
+			// Deadline / close during Stop — exit cleanly.
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				select {
+				case <-ctx.Done():
+					_ = c.Close()
+					return
+				case <-c.server.shutdown:
+					_ = c.Close()
+					return
+				default:
+				}
 			}
 			c.server.log.Debug("read frame ended", "peer", c.peerID, "err", err)
 			_ = c.Close()

@@ -43,6 +43,20 @@ func (r *InMemoryRegistry) Detach(peerID string) {
 	delete(r.m, peerID)
 }
 
+// CloseAll closes every registered session and clears the registry.
+// Used by Server.Stop so clients drop and re-HELLO after a gateway restart
+// (closing the listener alone leaves accepted TLS conns answering PING forever).
+func (r *InMemoryRegistry) CloseAll() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for id, s := range r.m {
+		if c, ok := s.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
+		delete(r.m, id)
+	}
+}
+
 // Len returns the number of registered sessions (for metrics / tests).
 func (r *InMemoryRegistry) Len() int {
 	r.mu.RLock()
