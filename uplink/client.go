@@ -29,10 +29,10 @@ type ClientOptions struct {
 
 // Client maintains a TCP/TLS session to the relay (spec §9.1).
 type Client struct {
-	opts       ClientOptions
-	addr       string
-	log        Logger
-	metrics    MetricsSink
+	opts         ClientOptions
+	addr         string
+	log          Logger
+	metrics      MetricsSink
 	maxPayload   uint32
 	backoff      BackoffConfig
 	keepAlive    time.Duration
@@ -47,6 +47,11 @@ type Client struct {
 	runWG   sync.WaitGroup
 	closed  atomic.Bool
 	started atomic.Bool
+
+	// writeMu serialises frames on the wire. It is separate from mu so a slow or
+	// stuck write cannot block state reads, Stop, or the ping loop. Lock ordering:
+	// never acquire writeMu while holding mu.
+	writeMu sync.Mutex
 }
 
 // NewClient validates options and returns a Client.
@@ -161,6 +166,7 @@ func (c *Client) Stop(ctx context.Context) error {
 }
 
 // SendPacket sends a DATA frame with the current session ID (spec §9.1).
+// Safe for concurrent use.
 func (c *Client) SendPacket(ctx context.Context, pkt []byte) error {
 	_ = ctx
 	if c.closed.Load() {
@@ -169,29 +175,49 @@ func (c *Client) SendPacket(ctx context.Context, pkt []byte) error {
 	if uint32(len(pkt)) > c.maxPayload {
 		return ErrInvalidFrame
 	}
+	// Copy conn under lock; release before writing so Stop can close the conn and
+	// unblock a stuck writer via SetWriteDeadline / Close.
 	c.mu.Lock()
 	conn := c.tlsConn
-	sid := c.sessID
-	st := c.State()
-	if conn == nil || st != StateActive {
+	c.mu.Unlock()
+	if conn == nil || c.State() != StateActive {
+		return ErrClientClosed
+	}
+
+	if err := c.writeOnConn(conn, MsgData, pkt); err != nil {
+		return err
+	}
+	c.metrics.IncCounter("proxy_client_frames_out_total", nil)
+	return nil
+}
+
+// writeOnConn serialises one frame onto conn. Any write error closes the
+// connection: the frame may be partially on the wire, so the stream can no
+// longer be framed reliably and the supervisor must reconnect instead of
+// continuing to send on a desynchronised session.
+func (c *Client) writeOnConn(conn *tls.Conn, msgType uint8, payload []byte) error {
+	c.mu.Lock()
+	if c.tlsConn != conn {
 		c.mu.Unlock()
 		return ErrClientClosed
 	}
-	hdr := FrameHeader{
-		Version:    ProtocolVersion,
-		MsgType:    MsgData,
-		SessionID:  sid,
-		PayloadLen: uint32(len(pkt)),
-	}
-	// Copy conn under lock; release before write so Stop can close the conn and
-	// unblock a stuck writer via SetWriteDeadline / Close.
+	sid := c.sessID
 	c.mu.Unlock()
 
+	c.writeMu.Lock()
 	_ = conn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
-	err := writeFrame(conn, hdr, pkt)
+	err := writeFrame(conn, FrameHeader{
+		Version:    ProtocolVersion,
+		MsgType:    msgType,
+		SessionID:  sid,
+		PayloadLen: uint32(len(payload)),
+	}, payload)
 	_ = conn.SetWriteDeadline(time.Time{})
-	if err == nil {
-		c.metrics.IncCounter("proxy_client_frames_out_total", nil)
+	c.writeMu.Unlock()
+
+	if err != nil {
+		c.log.Debug("uplink write failed, closing session", "msgType", msgType, "err", err)
+		_ = conn.Close()
 	}
 	return err
 }
@@ -254,11 +280,16 @@ func (c *Client) run(ctx context.Context) {
 			c.setState(StateFailed)
 			continue
 		}
-		if err := writeFrame(tlsConn, FrameHeader{
+		// Pre-session write: tlsConn is not published yet, so no writeMu is needed,
+		// but a deadline is, or a stalled handshake write hangs the supervisor.
+		_ = tlsConn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
+		err = writeFrame(tlsConn, FrameHeader{
 			Version:    ProtocolVersion,
 			MsgType:    MsgHello,
 			PayloadLen: uint32(len(payload)),
-		}, payload); err != nil {
+		}, payload)
+		_ = tlsConn.SetWriteDeadline(time.Time{})
+		if err != nil {
 			_ = tlsConn.Close()
 			c.setState(StateFailed)
 			if !c.sleepBackoff(ctx, cur) {
@@ -405,18 +436,7 @@ func (c *Client) pingLoop(ctx context.Context, conn *tls.Conn) {
 }
 
 func (c *Client) writeControl(conn *tls.Conn, msgType uint8, payload []byte) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.tlsConn != conn {
-		return ErrClientClosed
-	}
-	sid := c.sessID
-	return writeFrame(conn, FrameHeader{
-		Version:    ProtocolVersion,
-		MsgType:    msgType,
-		SessionID:  sid,
-		PayloadLen: uint32(len(payload)),
-	}, payload)
+	return c.writeOnConn(conn, msgType, payload)
 }
 
 func (c *Client) readLoop(ctx context.Context, conn *tls.Conn) error {

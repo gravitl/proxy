@@ -207,6 +207,27 @@ func (s *Server) SendToPeer(ctx context.Context, peerID string, pkt []byte) erro
 	return sw.sendData(ctx, pkt)
 }
 
+// SessionPeerIDs returns the peer IDs with an attached session, if the registry
+// supports enumeration.
+func (s *Server) SessionPeerIDs() []string {
+	if reg, ok := s.registry.(interface{ PeerIDs() []string }); ok {
+		return reg.PeerIDs()
+	}
+	return nil
+}
+
+// detach removes a session, preferring the identity-aware form so a session that
+// has already been replaced by a client reconnect does not evict its successor.
+func (s *Server) detach(peerID string, sess Session) {
+	if reg, ok := s.registry.(interface {
+		DetachSession(string, Session)
+	}); ok {
+		reg.DetachSession(peerID, sess)
+		return
+	}
+	s.registry.Detach(peerID)
+}
+
 func (s *Server) handleConnection(ctx context.Context, conn *tls.Conn) {
 	defer conn.Close()
 
@@ -274,7 +295,7 @@ func (s *Server) handleConnection(ctx context.Context, conn *tls.Conn) {
 	}
 
 	defer func() {
-		s.registry.Detach(res.PeerID)
+		s.detach(res.PeerID, cs)
 		cs.setState(SessionClosed)
 		if reg, ok := s.registry.(*InMemoryRegistry); ok {
 			s.metrics.SetGauge("proxy_server_active_sessions", float64(reg.Len()), nil)
@@ -339,12 +360,22 @@ func (c *connSession) writeFrameLocked(msgType uint8, payload []byte) error {
 	}, payload)
 }
 
+// writeFrame serialises one frame onto the session's connection. Any write error
+// closes the session: the frame may be partially on the wire, so the stream can
+// no longer be framed reliably and the client must reconnect rather than keep
+// receiving garbage on a desynchronised session.
 func (c *connSession) writeFrame(msgType uint8, payload []byte) error {
 	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
 	_ = c.conn.SetWriteDeadline(time.Now().Add(c.server.writeTimeout))
 	err := c.writeFrameLocked(msgType, payload)
 	_ = c.conn.SetWriteDeadline(time.Time{})
+	c.writeMu.Unlock()
+
+	if err != nil {
+		c.server.log.Debug("session write failed, closing session",
+			"peer", c.peerID, "msgType", msgType, "err", err)
+		_ = c.Close()
+	}
 	return err
 }
 
