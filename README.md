@@ -27,3 +27,11 @@ Name-based egress via HTTP CONNECT over the mesh (underlay remains WireGuard). S
 ```bash
 go test ./... -race
 ```
+
+## Release
+
+From GitHub Actions → **Release** → **Run workflow**: enter a semver (`v0.1.0` or `0.1.0`). The workflow runs tests, pushes an annotated tag, and creates a GitHub Release (notes auto-generated). Consumers can then:
+
+```bash
+go get github.com/gravitl/proxy/l7@v0.1.0
+```

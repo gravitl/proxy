@@ -154,7 +154,10 @@ func (s *Server) Addr() net.Addr {
 	return s.listener.Addr()
 }
 
-// Stop closes the listener and waits for handlers to finish.
+// Stop closes the listener, forcibly closes all attached sessions, and waits for handlers.
+// Session close is required: Accept() stopping alone leaves live TLS conns that still
+// answer client PING/PONG, so clients stay StateActive and never re-HELLO the new server
+// after a netclient soft restart (SIGHUP / pull).
 func (s *Server) Stop(ctx context.Context) error {
 	s.shutdownOnce.Do(func() {
 		close(s.shutdown)
@@ -165,6 +168,10 @@ func (s *Server) Stop(ctx context.Context) error {
 		s.startMu.Unlock()
 		if ln != nil {
 			_ = ln.Close()
+		}
+		// Unblock session readLoops so clients reconnect to a new listener.
+		if closer, ok := s.registry.(interface{ CloseAll() }); ok {
+			closer.CloseAll()
 		}
 	})
 
@@ -198,6 +205,27 @@ func (s *Server) SendToPeer(ctx context.Context, peerID string, pkt []byte) erro
 		return ErrNoSession
 	}
 	return sw.sendData(ctx, pkt)
+}
+
+// SessionPeerIDs returns the peer IDs with an attached session, if the registry
+// supports enumeration.
+func (s *Server) SessionPeerIDs() []string {
+	if reg, ok := s.registry.(interface{ PeerIDs() []string }); ok {
+		return reg.PeerIDs()
+	}
+	return nil
+}
+
+// detach removes a session, preferring the identity-aware form so a session that
+// has already been replaced by a client reconnect does not evict its successor.
+func (s *Server) detach(peerID string, sess Session) {
+	if reg, ok := s.registry.(interface {
+		DetachSession(string, Session)
+	}); ok {
+		reg.DetachSession(peerID, sess)
+		return
+	}
+	s.registry.Detach(peerID)
 }
 
 func (s *Server) handleConnection(ctx context.Context, conn *tls.Conn) {
@@ -267,7 +295,7 @@ func (s *Server) handleConnection(ctx context.Context, conn *tls.Conn) {
 	}
 
 	defer func() {
-		s.registry.Detach(res.PeerID)
+		s.detach(res.PeerID, cs)
 		cs.setState(SessionClosed)
 		if reg, ok := s.registry.(*InMemoryRegistry); ok {
 			s.metrics.SetGauge("proxy_server_active_sessions", float64(reg.Len()), nil)
@@ -332,12 +360,22 @@ func (c *connSession) writeFrameLocked(msgType uint8, payload []byte) error {
 	}, payload)
 }
 
+// writeFrame serialises one frame onto the session's connection. Any write error
+// closes the session: the frame may be partially on the wire, so the stream can
+// no longer be framed reliably and the client must reconnect rather than keep
+// receiving garbage on a desynchronised session.
 func (c *connSession) writeFrame(msgType uint8, payload []byte) error {
 	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
 	_ = c.conn.SetWriteDeadline(time.Now().Add(c.server.writeTimeout))
 	err := c.writeFrameLocked(msgType, payload)
 	_ = c.conn.SetWriteDeadline(time.Time{})
+	c.writeMu.Unlock()
+
+	if err != nil {
+		c.server.log.Debug("session write failed, closing session",
+			"peer", c.peerID, "msgType", msgType, "err", err)
+		_ = c.Close()
+	}
 	return err
 }
 
@@ -356,11 +394,32 @@ func (c *connSession) readLoop(ctx context.Context) {
 		if c.closed.Load() {
 			return
 		}
+		select {
+		case <-ctx.Done():
+			_ = c.Close()
+			return
+		case <-c.server.shutdown:
+			_ = c.Close()
+			return
+		default:
+		}
 		_ = c.conn.SetReadDeadline(time.Now().Add(c.server.keepAlive * 3))
 		h, payload, err := readFrame(c.conn, c.server.maxPayload)
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
 				return
+			}
+			// Deadline / close during Stop — exit cleanly.
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				select {
+				case <-ctx.Done():
+					_ = c.Close()
+					return
+				case <-c.server.shutdown:
+					_ = c.Close()
+					return
+				default:
+				}
 			}
 			c.server.log.Debug("read frame ended", "peer", c.peerID, "err", err)
 			_ = c.Close()
