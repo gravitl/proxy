@@ -95,3 +95,43 @@ func readFrame(r io.Reader, maxPayload uint32) (FrameHeader, []byte, error) {
 	}
 	return h, payload, nil
 }
+
+// encodeFrameBytes builds a complete framed message (header + payload) for
+// message-oriented transports (e.g. one WebSocket binary message per frame).
+// The length prefix is retained as compatibility framing; the message boundary
+// also equals the uplink message boundary.
+func encodeFrameBytes(h FrameHeader, payload []byte) ([]byte, error) {
+	if uint32(len(payload)) != h.PayloadLen {
+		return nil, fmt.Errorf("proxy: payload length mismatch: %w", ErrInvalidFrame)
+	}
+	hdr := encodeFrameHeader(h)
+	out := make([]byte, 0, frameHeaderSize+len(payload))
+	out = append(out, hdr[:]...)
+	out = append(out, payload...)
+	return out, nil
+}
+
+// decodeFrameBytes parses a complete framed message from a single buffer.
+func decodeFrameBytes(msg []byte, maxPayload uint32) (FrameHeader, []byte, error) {
+	if len(msg) < frameHeaderSize {
+		return FrameHeader{}, nil, ErrInvalidFrame
+	}
+	var raw [frameHeaderSize]byte
+	copy(raw[:], msg[:frameHeaderSize])
+	h := decodeFrameHeader(raw)
+	if h.Version != ProtocolVersion {
+		return FrameHeader{}, nil, ErrProtocolVersion
+	}
+	if h.PayloadLen > maxPayload {
+		return FrameHeader{}, nil, ErrInvalidFrame
+	}
+	if int(h.PayloadLen) != len(msg)-frameHeaderSize {
+		return FrameHeader{}, nil, ErrInvalidFrame
+	}
+	if h.PayloadLen == 0 {
+		return h, nil, nil
+	}
+	payload := make([]byte, h.PayloadLen)
+	copy(payload, msg[frameHeaderSize:])
+	return h, payload, nil
+}

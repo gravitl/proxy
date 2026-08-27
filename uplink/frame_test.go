@@ -36,3 +36,37 @@ func TestReadFrameOversize(t *testing.T) {
 		t.Fatalf("want ErrInvalidFrame, got %v", err)
 	}
 }
+
+func TestEncodeDecodeFrameBytes(t *testing.T) {
+	payload := []byte("hello-wg")
+	h := FrameHeader{
+		Version:    ProtocolVersion,
+		MsgType:    MsgData,
+		SessionID:  7,
+		PayloadLen: uint32(len(payload)),
+	}
+	msg, err := encodeFrameBytes(h, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rh, rp, err := decodeFrameBytes(msg, DefaultMaxFrameSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rh.MsgType != MsgData || rh.SessionID != 7 || string(rp) != string(payload) {
+		t.Fatalf("got %+v %q", rh, rp)
+	}
+}
+
+func TestDecodeFrameBytesOversize(t *testing.T) {
+	p := bytes.Repeat([]byte("x"), 100)
+	h := FrameHeader{Version: ProtocolVersion, MsgType: MsgData, PayloadLen: uint32(len(p))}
+	msg, err := encodeFrameBytes(h, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = decodeFrameBytes(msg, 50)
+	if err != ErrInvalidFrame {
+		t.Fatalf("want ErrInvalidFrame, got %v", err)
+	}
+}
