@@ -22,7 +22,7 @@ const (
 	DefaultMaxMessageSize = frameHeaderSize + DefaultMaxFrameSize
 
 	defaultWSPingInterval = 25 * time.Second
-	defaultWSPongWait     = 15 * time.Second
+	defaultWSPongWait     = 60 * time.Second
 )
 
 // wsUpgrader upgrades HTTP connections to WebSocket.
@@ -73,9 +73,11 @@ func NewWebSocketConn(ws *websocket.Conn, maxMsgSize int) *WebSocketConn {
 		status:       http.StatusSwitchingProtocols,
 	}
 	ws.SetReadLimit(c.maxMsgSize)
-	_ = ws.SetReadDeadline(time.Now().Add(c.pongWait))
+	// Read idle must cover the next Ping interval plus Pong wait; using only
+	// pongWait tears down idle sessions when pingInterval > pongWait.
+	_ = ws.SetReadDeadline(time.Now().Add(c.pingInterval + c.pongWait))
 	ws.SetPongHandler(func(string) error {
-		_ = ws.SetReadDeadline(time.Now().Add(c.pongWait))
+		_ = ws.SetReadDeadline(time.Now().Add(c.pingInterval + c.pongWait))
 		return nil
 	})
 	return c

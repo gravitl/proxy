@@ -31,7 +31,8 @@ type ServerOptions struct {
 	MaxFrameSize    int
 	// PingInterval for WebSocket Ping control frames (default 25s).
 	PingInterval time.Duration
-	// PongWait is how long to wait for a Pong after Ping / as read idle (default 15s).
+	// PongWait is how long after a Ping to allow for a Pong / read idle slack
+	// (default 60s). Effective read deadline is PingInterval+PongWait.
 	PongWait time.Duration
 }
 
