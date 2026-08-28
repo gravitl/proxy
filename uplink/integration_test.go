@@ -10,11 +10,29 @@ import (
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"encoding/pem"
+	"fmt"
 	"math/big"
+	"net"
 	"sync"
 	"testing"
 	"time"
 )
+
+func testClientURL(t *testing.T, s *Server, scheme string) string {
+	t.Helper()
+	addr := s.Addr()
+	if addr == nil {
+		t.Fatal("nil server addr")
+	}
+	host, port, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host == "::" || host == "0.0.0.0" {
+		host = "127.0.0.1"
+	}
+	return fmt.Sprintf("%s://%s/uplink/v1", scheme, net.JoinHostPort(host, port))
+}
 
 func TestClientServerDataRoundTrip(t *testing.T) {
 	srvTLS, cliTLS := testTLSConfigs(t)
@@ -36,6 +54,7 @@ func TestClientServerDataRoundTrip(t *testing.T) {
 
 	s, err := NewServer(ServerOptions{
 		ListenAddr:    "127.0.0.1:0",
+		TLSMode:       TLSModeSelfSigned,
 		TLSConfig:     srvTLS,
 		Authenticator: auth,
 		PacketHandler: ph,
@@ -52,12 +71,12 @@ func TestClientServerDataRoundTrip(t *testing.T) {
 	if err := s.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
-	addr := s.Addr().String()
+	url := testClientURL(t, s, "wss")
 
 	var inbound [][]byte
 	var inMu sync.Mutex
 	cli, err := NewClient(ClientOptions{
-		Addr: addr,
+		Addr: url,
 		TLSConfig: func() *tls.Config {
 			c := cliTLS.Clone()
 			c.ServerName = "test.local"
@@ -73,7 +92,7 @@ func TestClientServerDataRoundTrip(t *testing.T) {
 			return nil
 		},
 		Logger:          noopLogger{},
-		KeepAlivePeriod: time.Hour, // avoid ping noise in test
+		KeepAlivePeriod: time.Hour,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -116,13 +135,175 @@ func TestClientServerDataRoundTrip(t *testing.T) {
 	_ = s.Stop(context.Background())
 }
 
-// TestServerStopClosesSessions ensures Stop closes attached TLS sessions so a client
-// leaves StateActive (gateway soft-restart must force re-HELLO onto a new server).
+func TestProxyTLSModePlainWS(t *testing.T) {
+	var received [][]byte
+	var mu sync.Mutex
+
+	s, err := NewServer(ServerOptions{
+		ListenAddr: "127.0.0.1:0",
+		TLSMode:    TLSModeProxy,
+		Authenticator: &fnAuthenticator{fn: func(ctx context.Context, hello ClientHello) (*AuthResult, error) {
+			return &AuthResult{PeerID: "peer-1"}, nil
+		}},
+		PacketHandler: &fnPacketHandler{fn: func(ctx context.Context, peerID string, pkt []byte) error {
+			mu.Lock()
+			received = append(received, append([]byte(nil), pkt...))
+			mu.Unlock()
+			return nil
+		}},
+		Logger: noopLogger{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := s.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Stop(context.Background()) }()
+
+	cli, err := NewClient(ClientOptions{
+		Addr: testClientURL(t, s, "ws"),
+		HelloFactory: func() (ClientHello, error) {
+			return ClientHello{Version: 1, NodeID: "n1", RelayPeerID: "r1", PublicKey: "pk", Proof: "p"}, nil
+		},
+		PacketHandler:   func(b []byte) error { return nil },
+		Logger:          noopLogger{},
+		KeepAlivePeriod: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cli.Stop(context.Background()) }()
+
+	deadline := time.After(5 * time.Second)
+	for cli.State() != StateActive {
+		select {
+		case <-deadline:
+			t.Fatalf("client not active: %s", cli.State())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if err := cli.SendPacket(ctx, []byte("hi")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(received) != 1 || string(received[0]) != "hi" {
+		t.Fatalf("got %v", received)
+	}
+}
+
+func TestDefaultTLSModeSelfSigned(t *testing.T) {
+	mode, err := ParseTLSMode("")
+	if err != nil || mode != TLSModeSelfSigned {
+		t.Fatalf("got %q %v", mode, err)
+	}
+}
+
+func TestInvalidTLSMode(t *testing.T) {
+	_, err := NewServer(ServerOptions{
+		ListenAddr: "127.0.0.1:0",
+		TLSMode:    "acme",
+		Authenticator: &fnAuthenticator{fn: func(ctx context.Context, hello ClientHello) (*AuthResult, error) {
+			return &AuthResult{PeerID: "p"}, nil
+		}},
+		PacketHandler: &fnPacketHandler{fn: func(ctx context.Context, peerID string, pkt []byte) error {
+			return nil
+		}},
+	})
+	if err == nil {
+		t.Fatal("expected error for invalid TLS mode")
+	}
+}
+
+func TestWrongRouteRejected(t *testing.T) {
+	s, err := NewServer(ServerOptions{
+		ListenAddr: "127.0.0.1:0",
+		TLSMode:    TLSModeProxy,
+		Authenticator: &fnAuthenticator{fn: func(ctx context.Context, hello ClientHello) (*AuthResult, error) {
+			return &AuthResult{PeerID: "p"}, nil
+		}},
+		PacketHandler: &fnPacketHandler{fn: func(ctx context.Context, peerID string, pkt []byte) error {
+			return nil
+		}},
+		Logger: noopLogger{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := s.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Stop(context.Background()) }()
+
+	addr := s.Addr().String()
+	_, err = DialWebSocket(ctx, "ws://"+addr+"/wrong", nil, time.Second)
+	if err == nil {
+		t.Fatal("expected dial to wrong path to fail")
+	}
+}
+
+func TestAuthRejected(t *testing.T) {
+	s, err := NewServer(ServerOptions{
+		ListenAddr: "127.0.0.1:0",
+		TLSMode:    TLSModeProxy,
+		Authenticator: &fnAuthenticator{fn: func(ctx context.Context, hello ClientHello) (*AuthResult, error) {
+			return nil, errorsNew("nope")
+		}},
+		PacketHandler: &fnPacketHandler{fn: func(ctx context.Context, peerID string, pkt []byte) error {
+			return nil
+		}},
+		Logger: noopLogger{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := s.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Stop(context.Background()) }()
+
+	cli, err := NewClient(ClientOptions{
+		Addr: testClientURL(t, s, "ws"),
+		HelloFactory: func() (ClientHello, error) {
+			return ClientHello{Version: 1, NodeID: "n1", RelayPeerID: "r1", PublicKey: "pk", Proof: "p"}, nil
+		},
+		PacketHandler:   func(b []byte) error { return nil },
+		Logger:          noopLogger{},
+		KeepAlivePeriod: time.Hour,
+		ReconnectBackoff: BackoffConfig{Initial: 50 * time.Millisecond, Max: 100 * time.Millisecond, Factor: 1.5},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cli.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cli.Stop(context.Background()) }()
+
+	time.Sleep(300 * time.Millisecond)
+	if cli.State() == StateActive {
+		t.Fatal("client should not be active after auth failure")
+	}
+}
+
+func errorsNew(s string) error { return fmt.Errorf("%s", s) }
+
 func TestServerStopClosesSessions(t *testing.T) {
 	srvTLS, cliTLS := testTLSConfigs(t)
 
 	s, err := NewServer(ServerOptions{
 		ListenAddr: "127.0.0.1:0",
+		TLSMode:    TLSModeSelfSigned,
 		TLSConfig:  srvTLS,
 		Authenticator: &fnAuthenticator{fn: func(ctx context.Context, hello ClientHello) (*AuthResult, error) {
 			return &AuthResult{PeerID: "peer-1"}, nil
@@ -143,7 +324,7 @@ func TestServerStopClosesSessions(t *testing.T) {
 	}
 
 	cli, err := NewClient(ClientOptions{
-		Addr: s.Addr().String(),
+		Addr: testClientURL(t, s, "wss"),
 		TLSConfig: func() *tls.Config {
 			c := cliTLS.Clone()
 			c.ServerName = "test.local"
@@ -190,11 +371,6 @@ func TestServerStopClosesSessions(t *testing.T) {
 	_ = cli.Stop(context.Background())
 }
 
-// TestConcurrentSendPacketFramingIntegrity sends from many goroutines while
-// keepalive PINGs share the same connection. Writing a frame's header and payload
-// as separate unsynchronised writes lets those writers interleave, which
-// desynchronises the server's framing permanently, so every packet must arrive
-// intact and exactly once.
 func TestConcurrentSendPacketFramingIntegrity(t *testing.T) {
 	const (
 		senders        = 8
@@ -229,6 +405,7 @@ func TestConcurrentSendPacketFramingIntegrity(t *testing.T) {
 
 	s, err := NewServer(ServerOptions{
 		ListenAddr: "127.0.0.1:0",
+		TLSMode:    TLSModeSelfSigned,
 		TLSConfig:  srvTLS,
 		Authenticator: &fnAuthenticator{fn: func(ctx context.Context, hello ClientHello) (*AuthResult, error) {
 			return &AuthResult{PeerID: "peer-1"}, nil
@@ -248,7 +425,7 @@ func TestConcurrentSendPacketFramingIntegrity(t *testing.T) {
 	defer func() { _ = s.Stop(context.Background()) }()
 
 	cli, err := NewClient(ClientOptions{
-		Addr: s.Addr().String(),
+		Addr: testClientURL(t, s, "wss"),
 		TLSConfig: func() *tls.Config {
 			c := cliTLS.Clone()
 			c.ServerName = "test.local"
@@ -257,10 +434,8 @@ func TestConcurrentSendPacketFramingIntegrity(t *testing.T) {
 		HelloFactory: func() (ClientHello, error) {
 			return ClientHello{Version: 1, NodeID: "n1", RelayPeerID: "r1", PublicKey: "pk", Proof: "p"}, nil
 		},
-		PacketHandler: func(b []byte) error { return nil },
-		Logger:        noopLogger{},
-		// Keepalive also drives the client read deadline (keepAlive*3), so keep it
-		// generous here; PING contention is driven explicitly below.
+		PacketHandler:   func(b []byte) error { return nil },
+		Logger:          noopLogger{},
 		KeepAlivePeriod: 2 * time.Second,
 		WriteTimeout:    10 * time.Second,
 	})
@@ -282,15 +457,12 @@ func TestConcurrentSendPacketFramingIntegrity(t *testing.T) {
 	}
 
 	cli.mu.Lock()
-	conn := cli.tlsConn
+	conn := cli.conn
 	cli.mu.Unlock()
 	if conn == nil {
 		t.Fatal("no active connection")
 	}
 
-	// Interleave control frames with DATA frames on the same connection: this is
-	// the path that corrupted framing, since PINGs and PONGs are written by the
-	// ping loop and read loop while callers are sending packets.
 	pingStop := make(chan struct{})
 	var pingWG sync.WaitGroup
 	pingWG.Add(1)
@@ -347,8 +519,6 @@ func TestConcurrentSendPacketFramingIntegrity(t *testing.T) {
 	}
 }
 
-// encodeTestPacket builds a self-describing payload: seq, length, then a filler
-// byte derived from seq, so any truncation or splice is detectable.
 func encodeTestPacket(seq, size int) []byte {
 	if size < 8 {
 		size = 8
@@ -408,6 +578,7 @@ func testTLSConfigs(t *testing.T) (server *tls.Config, client *tls.Config) {
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(24 * time.Hour),
 		DNSNames:     []string{"test.local"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
 		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
