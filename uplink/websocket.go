@@ -105,11 +105,14 @@ func (c *WebSocketConn) StartPingLoop(ctx context.Context) {
 	}
 	pctx, cancel := context.WithCancel(ctx)
 	c.pingCancel = cancel
-	c.pingDone = make(chan struct{})
+	done := make(chan struct{})
+	c.pingDone = done
 	c.pingMu.Unlock()
 
 	go func() {
-		defer close(c.pingDone)
+		// Close the local done channel, not c.pingDone: stopPing nils the field
+		// before waiting, so defer close(c.pingDone) would panic on a nil channel.
+		defer close(done)
 		t := time.NewTicker(c.pingInterval)
 		defer t.Stop()
 		for {
