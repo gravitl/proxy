@@ -6,16 +6,24 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"net"
+	"math/rand"
+	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// ClientOptions configures the TCP/TLS uplink client (spec §9.1).
+// ClientOptions configures the WebSocket uplink client.
 type ClientOptions struct {
-	Addr             string
-	ServerName       string
+	// Addr is the uplink endpoint. Prefer a full URL:
+	//   wss://gateway.example.com/uplink/v1
+	// Legacy host:port is accepted and rewritten to wss://host:port/uplink/v1.
+	Addr string
+	// ServerName is TLS SNI (optional; derived from URL host when empty).
+	ServerName string
+	// TLSConfig configures TLS verification for wss:// dials.
+	// Required for wss; ignored for plain ws:// (proxy-mode internal tests).
 	TLSConfig        *tls.Config
 	HelloFactory     func() (ClientHello, error)
 	PacketHandler    func([]byte) error
@@ -25,28 +33,36 @@ type ClientOptions struct {
 	WriteTimeout     time.Duration
 	ReconnectBackoff BackoffConfig
 	MaxFrameSize     int
+	PingInterval     time.Duration
+	PongWait         time.Duration
+	HandshakeTimeout time.Duration
 }
 
-// Client maintains a TCP/TLS session to the relay (spec §9.1).
+// Client maintains a WebSocket session to the relay/gateway.
 type Client struct {
-	opts       ClientOptions
-	addr       string
-	log        Logger
-	metrics    MetricsSink
+	opts         ClientOptions
+	addr         string // normalised dial URL
+	log          Logger
+	metrics      MetricsSink
 	maxPayload   uint32
 	backoff      BackoffConfig
 	keepAlive    time.Duration
 	writeTimeout time.Duration
+	pingInterval time.Duration
+	pongWait     time.Duration
 	tlsConfig    *tls.Config
 
 	mu      sync.Mutex
 	state   atomic.Value // ClientState
-	tlsConn *tls.Conn
+	conn    Conn
 	sessID  uint32
 	cancel  context.CancelFunc
 	runWG   sync.WaitGroup
 	closed  atomic.Bool
 	started atomic.Bool
+
+	// writeMu serialises frames. Never acquire writeMu while holding mu.
+	writeMu sync.Mutex
 }
 
 // NewClient validates options and returns a Client.
@@ -54,8 +70,13 @@ func NewClient(opts ClientOptions) (*Client, error) {
 	if opts.Addr == "" {
 		return nil, errors.New("proxy: Addr is required")
 	}
-	if opts.TLSConfig == nil {
-		return nil, errors.New("proxy: TLSConfig is required")
+	dialURL, err := NormaliseUplinkURL(opts.Addr)
+	if err != nil {
+		return nil, err
+	}
+	needsTLS := strings.HasPrefix(dialURL, "wss://")
+	if needsTLS && opts.TLSConfig == nil {
+		return nil, errors.New("proxy: TLSConfig is required for wss://")
 	}
 	if opts.HelloFactory == nil {
 		return nil, errors.New("proxy: HelloFactory is required")
@@ -83,26 +104,74 @@ func NewClient(opts ClientOptions) (*Client, error) {
 	if wt <= 0 {
 		wt = 2 * time.Second
 	}
-	cfg := opts.TLSConfig.Clone()
-	if opts.ServerName != "" {
-		cfg.ServerName = opts.ServerName
+	pi := opts.PingInterval
+	if pi <= 0 {
+		pi = defaultWSPingInterval
+	}
+	pw := opts.PongWait
+	if pw <= 0 {
+		pw = defaultWSPongWait
+	}
+	var cfg *tls.Config
+	if opts.TLSConfig != nil {
+		cfg = opts.TLSConfig.Clone()
+		if opts.ServerName != "" {
+			cfg.ServerName = opts.ServerName
+		} else if cfg.ServerName == "" {
+			if u, err := url.Parse(dialURL); err == nil {
+				cfg.ServerName = u.Hostname()
+			}
+		}
 	}
 	c := &Client{
 		opts:         opts,
-		addr:         opts.Addr,
+		addr:         dialURL,
 		log:          log,
 		metrics:      metrics,
 		maxPayload:   uint32(max),
 		backoff:      opts.ReconnectBackoff.withDefaults(),
 		keepAlive:    ka,
 		writeTimeout: wt,
+		pingInterval: pi,
+		pongWait:     pw,
 		tlsConfig:    cfg,
 	}
 	c.state.Store(ClientState(StateDisconnected))
 	return c, nil
 }
 
-// State returns the current client state (spec §13.1).
+// NormaliseUplinkURL accepts wss://…/uplink/v1 or legacy host:port.
+func NormaliseUplinkURL(addr string) (string, error) {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return "", errors.New("proxy: empty uplink address")
+	}
+	if strings.Contains(addr, "://") {
+		u, err := url.Parse(addr)
+		if err != nil {
+			return "", err
+		}
+		switch u.Scheme {
+		case "wss", "ws", "https", "http":
+		default:
+			return "", errors.New("proxy: unsupported uplink URL scheme")
+		}
+		switch u.Scheme {
+		case "https":
+			u.Scheme = "wss"
+		case "http":
+			u.Scheme = "ws"
+		}
+		if u.Path == "" || u.Path == "/" {
+			u.Path = UplinkWSPath
+		}
+		return u.String(), nil
+	}
+	// Legacy host:port → wss://host:port/uplink/v1
+	return "wss://" + addr + UplinkWSPath, nil
+}
+
+// State returns the current client state.
 func (c *Client) State() ClientState {
 	v := c.state.Load()
 	if v == nil {
@@ -138,8 +207,8 @@ func (c *Client) Stop(ctx context.Context) error {
 	c.mu.Lock()
 	cancel := c.cancel
 	c.cancel = nil
-	conn := c.tlsConn
-	c.tlsConn = nil
+	conn := c.conn
+	c.conn = nil
 	c.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -160,7 +229,7 @@ func (c *Client) Stop(ctx context.Context) error {
 	return nil
 }
 
-// SendPacket sends a DATA frame with the current session ID (spec §9.1).
+// SendPacket sends a DATA frame with the current session ID. Safe for concurrent use.
 func (c *Client) SendPacket(ctx context.Context, pkt []byte) error {
 	_ = ctx
 	if c.closed.Load() {
@@ -170,28 +239,43 @@ func (c *Client) SendPacket(ctx context.Context, pkt []byte) error {
 		return ErrInvalidFrame
 	}
 	c.mu.Lock()
-	conn := c.tlsConn
-	sid := c.sessID
-	st := c.State()
-	if conn == nil || st != StateActive {
+	conn := c.conn
+	c.mu.Unlock()
+	if conn == nil || c.State() != StateActive {
+		return ErrClientClosed
+	}
+
+	if err := c.writeOnConn(conn, MsgData, pkt); err != nil {
+		return err
+	}
+	c.metrics.IncCounter("proxy_client_frames_out_total", nil)
+	c.metrics.IncCounter("uplink_packets_tx_total", map[string]string{"transport": "wss"})
+	return nil
+}
+
+func (c *Client) writeOnConn(conn Conn, msgType uint8, payload []byte) error {
+	c.mu.Lock()
+	if c.conn != conn {
 		c.mu.Unlock()
 		return ErrClientClosed
 	}
-	hdr := FrameHeader{
-		Version:    ProtocolVersion,
-		MsgType:    MsgData,
-		SessionID:  sid,
-		PayloadLen: uint32(len(pkt)),
-	}
-	// Copy conn under lock; release before write so Stop can close the conn and
-	// unblock a stuck writer via SetWriteDeadline / Close.
+	sid := c.sessID
 	c.mu.Unlock()
 
+	c.writeMu.Lock()
 	_ = conn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
-	err := writeFrame(conn, hdr, pkt)
+	err := conn.WriteFrame(FrameHeader{
+		Version:    ProtocolVersion,
+		MsgType:    msgType,
+		SessionID:  sid,
+		PayloadLen: uint32(len(payload)),
+	}, payload)
 	_ = conn.SetWriteDeadline(time.Time{})
-	if err == nil {
-		c.metrics.IncCounter("proxy_client_frames_out_total", nil)
+	c.writeMu.Unlock()
+
+	if err != nil {
+		c.log.Debug("uplink write failed, closing session", "msgType", msgType, "err", err)
+		_ = conn.Close()
 	}
 	return err
 }
@@ -211,37 +295,48 @@ func (c *Client) run(ctx context.Context) {
 		}
 
 		c.setState(StateConnecting)
-		d := net.Dialer{Timeout: 15 * time.Second}
-		raw, err := d.DialContext(ctx, "tcp", c.addr)
-		if err != nil {
-			c.log.Warn("dial failed", "addr", c.addr, "err", err)
-			c.setState(StateFailed)
-			if !c.sleepBackoff(ctx, cur) {
-				return
-			}
-			cur = nextBackoff(cur, b)
-			continue
-		}
+		c.log.Info("uplink: connecting",
+			"transport", "wss",
+			"url", c.addr,
+		)
 
-		tlsConn := tls.Client(raw, c.tlsConfig)
-		if err := tlsConn.HandshakeContext(ctx); err != nil {
-			c.log.Warn("tls handshake failed", "err", err)
-			_ = tlsConn.Close()
+		wsConn, err := DialWebSocket(ctx, c.addr, c.tlsConfig, c.opts.HandshakeTimeout)
+		if err != nil {
+			c.log.Warn("uplink: websocket dial failed",
+				"transport", "wss",
+				"url", c.addr,
+				"err", err,
+			)
 			c.setState(StateFailed)
-			if !c.sleepBackoff(ctx, cur) {
+			c.metrics.IncCounter("uplink_connection_errors_total", map[string]string{"transport": "wss"})
+			c.metrics.IncCounter("uplink_reconnects_total", map[string]string{"transport": "wss"})
+			c.log.Info("uplink: reconnect scheduled",
+				"transport", "wss",
+				"url", c.addr,
+				"backoff", cur.String(),
+			)
+			if !c.sleepBackoff(ctx, jitterDuration(cur)) {
 				return
 			}
 			cur = nextBackoff(cur, b)
 			continue
 		}
+		wsConn.pingInterval = c.pingInterval
+		wsConn.pongWait = c.pongWait
 		c.setState(StateTLSReady)
+		c.log.Info("uplink: websocket connection established",
+			"transport", "wss",
+			"url", c.addr,
+			"remote", wsConn.RemoteAddr(),
+			"status", wsConn.HandshakeStatus(),
+		)
 
 		hello, err := c.opts.HelloFactory()
 		if err != nil {
 			c.log.Error("hello factory", "err", err)
-			_ = tlsConn.Close()
+			_ = wsConn.Close()
 			c.setState(StateFailed)
-			if !c.sleepBackoff(ctx, cur) {
+			if !c.sleepBackoff(ctx, jitterDuration(cur)) {
 				return
 			}
 			cur = nextBackoff(cur, b)
@@ -250,52 +345,62 @@ func (c *Client) run(ctx context.Context) {
 		c.setState(StateAuthenticating)
 		payload, err := json.Marshal(hello)
 		if err != nil {
-			_ = tlsConn.Close()
+			_ = wsConn.Close()
 			c.setState(StateFailed)
 			continue
 		}
-		if err := writeFrame(tlsConn, FrameHeader{
+		_ = wsConn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
+		err = wsConn.WriteFrame(FrameHeader{
 			Version:    ProtocolVersion,
 			MsgType:    MsgHello,
 			PayloadLen: uint32(len(payload)),
-		}, payload); err != nil {
-			_ = tlsConn.Close()
+		}, payload)
+		_ = wsConn.SetWriteDeadline(time.Time{})
+		if err != nil {
+			_ = wsConn.Close()
 			c.setState(StateFailed)
-			if !c.sleepBackoff(ctx, cur) {
+			if !c.sleepBackoff(ctx, jitterDuration(cur)) {
 				return
 			}
 			cur = nextBackoff(cur, b)
 			continue
 		}
 
-		_ = tlsConn.SetReadDeadline(time.Now().Add(30 * time.Second))
-		h, ack, err := readFrame(tlsConn, c.maxPayload)
+		_ = wsConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		h, ack, err := wsConn.ReadFrame(c.maxPayload)
 		if err != nil {
 			c.log.Warn("read hello ack", "err", err)
-			_ = tlsConn.Close()
+			_ = wsConn.Close()
 			c.setState(StateFailed)
-			if !c.sleepBackoff(ctx, cur) {
+			if !c.sleepBackoff(ctx, jitterDuration(cur)) {
 				return
 			}
 			cur = nextBackoff(cur, b)
 			continue
 		}
 		if h.MsgType == MsgError {
-			c.log.Warn("server rejected hello")
-			_ = tlsConn.Close()
+			c.log.Warn("uplink: authentication failed",
+				"transport", "wss",
+				"url", c.addr,
+			)
+			_ = wsConn.Close()
 			c.setState(StateFailed)
 			c.metrics.IncCounter("proxy_client_auth_failures_total", nil)
-			if !c.sleepBackoff(ctx, cur) {
+			c.metrics.IncCounter("uplink_auth_failures_total", map[string]string{"transport": "wss"})
+			if !c.sleepBackoff(ctx, jitterDuration(cur)) {
 				return
 			}
 			cur = nextBackoff(cur, b)
 			continue
 		}
 		if h.MsgType != MsgHelloAck {
-			c.log.Warn("unexpected hello response", "type", h.MsgType)
-			_ = tlsConn.Close()
+			c.log.Warn("uplink: unexpected hello response",
+				"transport", "wss",
+				"type", h.MsgType,
+			)
+			_ = wsConn.Close()
 			c.setState(StateFailed)
-			if !c.sleepBackoff(ctx, cur) {
+			if !c.sleepBackoff(ctx, jitterDuration(cur)) {
 				return
 			}
 			cur = nextBackoff(cur, b)
@@ -303,52 +408,73 @@ func (c *Client) run(ctx context.Context) {
 		}
 		var hw helloAckWire
 		if err := json.Unmarshal(ack, &hw); err != nil {
-			_ = tlsConn.Close()
+			_ = wsConn.Close()
 			c.setState(StateFailed)
 			continue
 		}
 
+		sessCtx, sessCancel := context.WithCancel(ctx)
+		wsConn.StartPingLoop(sessCtx)
+
 		c.mu.Lock()
-		c.tlsConn = tlsConn
+		c.conn = wsConn
 		c.sessID = hw.SessionID
 		c.mu.Unlock()
 		c.setState(StateActive)
 		cur = b.Initial
 		c.metrics.IncCounter("proxy_client_sessions_active_total", nil)
+		c.log.Info("uplink: authenticated",
+			"transport", "wss",
+			"url", c.addr,
+			"remote", wsConn.RemoteAddr(),
+			"session_id", hw.SessionID,
+		)
 
-		pingCtx, pingCancel := context.WithCancel(ctx)
+		pingCtx, pingCancel := context.WithCancel(sessCtx)
 		pingDone := make(chan struct{})
 		go func() {
 			defer close(pingDone)
-			c.pingLoop(pingCtx, tlsConn)
+			c.pingLoop(pingCtx, wsConn)
 		}()
 
 		readErr := make(chan error, 1)
 		go func() {
-			readErr <- c.readLoop(ctx, tlsConn)
+			readErr <- c.readLoop(sessCtx, wsConn)
 		}()
 
 		select {
 		case <-ctx.Done():
 			pingCancel()
+			sessCancel()
 			<-pingDone
-			_ = tlsConn.Close()
+			_ = wsConn.Close()
 			c.clearConn()
 			c.setState(StateClosing)
 			return
 		case err := <-readErr:
 			pingCancel()
+			sessCancel()
 			<-pingDone
 			if err != nil && !errors.Is(err, io.EOF) {
 				c.log.Debug("read loop ended", "err", err)
 			}
-			_ = tlsConn.Close()
+			_ = wsConn.Close()
 			c.clearConn()
 			c.setState(StateFailed)
+			c.log.Info("uplink: websocket disconnected",
+				"transport", "wss",
+				"url", c.addr,
+			)
+			c.metrics.IncCounter("uplink_reconnects_total", map[string]string{"transport": "wss"})
 			if c.closed.Load() {
 				return
 			}
-			if !c.sleepBackoff(ctx, cur) {
+			c.log.Info("uplink: reconnect scheduled",
+				"transport", "wss",
+				"url", c.addr,
+				"backoff", cur.String(),
+			)
+			if !c.sleepBackoff(ctx, jitterDuration(cur)) {
 				return
 			}
 			cur = nextBackoff(cur, b)
@@ -358,7 +484,7 @@ func (c *Client) run(ctx context.Context) {
 
 func (c *Client) clearConn() {
 	c.mu.Lock()
-	c.tlsConn = nil
+	c.conn = nil
 	c.sessID = 0
 	c.mu.Unlock()
 }
@@ -382,7 +508,16 @@ func nextBackoff(cur time.Duration, b BackoffConfig) time.Duration {
 	return next
 }
 
-func (c *Client) pingLoop(ctx context.Context, conn *tls.Conn) {
+func jitterDuration(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	// Full jitter in [d/2, d].
+	half := d / 2
+	return half + time.Duration(rand.Int63n(int64(half)+1))
+}
+
+func (c *Client) pingLoop(ctx context.Context, conn Conn) {
 	t := time.NewTicker(c.keepAlive)
 	defer t.Stop()
 	for {
@@ -391,7 +526,7 @@ func (c *Client) pingLoop(ctx context.Context, conn *tls.Conn) {
 			return
 		case <-t.C:
 			c.mu.Lock()
-			active := c.tlsConn == conn && c.State() == StateActive
+			active := c.conn == conn && c.State() == StateActive
 			c.mu.Unlock()
 			if !active {
 				return
@@ -404,31 +539,28 @@ func (c *Client) pingLoop(ctx context.Context, conn *tls.Conn) {
 	}
 }
 
-func (c *Client) writeControl(conn *tls.Conn, msgType uint8, payload []byte) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.tlsConn != conn {
-		return ErrClientClosed
-	}
-	sid := c.sessID
-	return writeFrame(conn, FrameHeader{
-		Version:    ProtocolVersion,
-		MsgType:    msgType,
-		SessionID:  sid,
-		PayloadLen: uint32(len(payload)),
-	}, payload)
+func (c *Client) writeControl(conn Conn, msgType uint8, payload []byte) error {
+	return c.writeOnConn(conn, msgType, payload)
 }
 
-func (c *Client) readLoop(ctx context.Context, conn *tls.Conn) error {
+func (c *Client) readLoop(ctx context.Context, conn Conn) error {
+	idle := c.pongWait * 2
+	if idle < c.keepAlive*3 {
+		idle = c.keepAlive * 3
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
-		_ = conn.SetReadDeadline(time.Now().Add(c.keepAlive * 3))
-		h, payload, err := readFrame(conn, c.maxPayload)
+		_ = conn.SetReadDeadline(time.Now().Add(idle))
+		h, payload, err := conn.ReadFrame(c.maxPayload)
 		if err != nil {
+			if ne, ok := err.(interface{ Timeout() bool }); ok && ne.Timeout() {
+				c.log.Info("uplink pong timeout")
+				c.metrics.IncCounter("uplink_ping_timeout_total", map[string]string{"transport": "wss"})
+			}
 			return err
 		}
 		switch h.MsgType {
@@ -437,6 +569,7 @@ func (c *Client) readLoop(ctx context.Context, conn *tls.Conn) error {
 				c.log.Warn("packet handler error", "err", err)
 			}
 			c.metrics.IncCounter("proxy_client_frames_in_total", nil)
+			c.metrics.IncCounter("uplink_packets_rx_total", map[string]string{"transport": "wss"})
 		case MsgPing:
 			_ = c.writeControl(conn, MsgPong, nil)
 		case MsgPong:
