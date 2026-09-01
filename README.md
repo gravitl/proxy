@@ -6,17 +6,26 @@ Netmaker proxy libraries (one Go module, feature packages).
 
 | Import | Role |
 |--------|------|
-| [`github.com/gravitl/proxy/uplink`](uplink/) | Phase 1: TCP/TLS framed WireGuard uplink (C ↔ relay/gateway B) |
+| [`github.com/gravitl/proxy/uplink`](uplink/) | Framed WireGuard uplink over WebSocket (`C` ↔ relay/gateway `B`) |
 | [`github.com/gravitl/proxy/l7`](l7/) | L7: HTTP CONNECT forward proxy for app-domain egress |
 
 There is **no** root package API — import the subpackage you need.
 
 ### Uplink
 
-- **Client**: TCP + TLS + framed `MsgData` carrying WireGuard packet bytes to the relay.
-- **Server** (relay / gateway, also a WireGuard peer): terminates TLS, authenticates `ClientHello`, registers sessions, and supports `SendToPeer` for reverse traffic.
+Application transport is always **WebSocket** on `/uplink/v1`. Each binary message carries one uplink frame (12-byte header + payload) with `MsgData` WireGuard packet bytes.
 
-See [`uplink/example_test.go`](uplink/example_test.go) and [docs/PROXY_PHASE1_ARCHITECTURE.md](docs/PROXY_PHASE1_ARCHITECTURE.md).
+TLS termination is independent of that transport:
+
+| Mode | Value | Behavior |
+|------|-------|----------|
+| Self-signed (default) | `selfsigned` | Uplink terminates TLS and serves `wss://` |
+| Reverse proxy | `proxy` | Upstream proxy terminates TLS; uplink serves plain `ws://` on an internal bind |
+
+- **Client** dials `wss://…/uplink/v1` (or `ws://` when the listener is behind a TLS terminator), completes `ClientHello` authentication (WireGuard key proofs), then exchanges framed `MsgData` and keepalive pings.
+- **Server** (relay / gateway, still a WireGuard peer) accepts the WebSocket, authenticates, registers sessions, and supports `SendToPeer` for reverse traffic.
+
+See [`uplink/example_test.go`](uplink/example_test.go), [docs/PROXY_WSS_UPLINK.md](docs/PROXY_WSS_UPLINK.md), and [docs/PROXY_PHASE1_ARCHITECTURE.md](docs/PROXY_PHASE1_ARCHITECTURE.md).
 
 ### L7
 
